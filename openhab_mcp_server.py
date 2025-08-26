@@ -18,9 +18,7 @@ from pydantic import Field
 logging.basicConfig(level=logging.INFO)
 
 # Import the MCP server implementation
-from mcp.server import FastMCP
-from mcp.types import TextContent
-
+from fastmcp.server import FastMCP
 from template_manager import TemplateManager, ProcessTemplate
 
 template_manager = TemplateManager()
@@ -52,12 +50,13 @@ OPENHAB_URL = os.environ.get("OPENHAB_URL", "http://localhost:8080")
 OPENHAB_API_TOKEN = os.environ.get("OPENHAB_API_TOKEN")
 OPENHAB_USERNAME = os.environ.get("OPENHAB_USERNAME")
 OPENHAB_PASSWORD = os.environ.get("OPENHAB_PASSWORD")
-OPENHAB_MCP_TRANSPORT = os.environ.get("OPENHAB_MCP_TRANSPORT", "stdio")
+MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
+MCP_PORT = os.environ.get("MCP_PORT", "8000")
 
-if OPENHAB_MCP_TRANSPORT == "streamable-http":
-    mcp = FastMCP("OpenHAB MCP Server", stateless_http=True)
-else:
-    mcp = FastMCP("OpenHAB MCP Server")
+# possible FastMCP connection types
+TRANSPORT_TYPES = ["stdio", "http", "sse"]
+
+mcp = FastMCP("OpenHAB MCP Server")
 
 if not OPENHAB_API_TOKEN and not (OPENHAB_USERNAME and OPENHAB_PASSWORD):
     print(
@@ -1244,4 +1243,12 @@ def get_task_template_schema() -> Dict[str, Any]:
 mcp.template_manager = template_manager
 
 if __name__ == "__main__":
-    mcp.run(transport=OPENHAB_MCP_TRANSPORT)
+    if MCP_TRANSPORT in TRANSPORT_TYPES:
+        if MCP_TRANSPORT == "stdio":
+            mcp.run(transport=MCP_TRANSPORT)
+        elif MCP_TRANSPORT == "http":
+            mcp.run(transport=MCP_TRANSPORT, host="127.0.0.1", port=int(MCP_PORT), path="/mcp")
+        elif MCP_TRANSPORT == "sse":
+            mcp.run(transport=MCP_TRANSPORT, host="127.0.0.1", port=int(MCP_PORT))
+    else:
+        print("Transport-Type has to be stdio, http or sse")

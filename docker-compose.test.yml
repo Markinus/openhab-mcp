@@ -31,6 +31,8 @@ services:
       - OPENHAB_API_TOKEN=${OPENHAB_API_TOKEN:-}
       - OPENHAB_USERNAME=${OPENHAB_USERNAME:-}
       - OPENHAB_PASSWORD=${OPENHAB_PASSWORD:-}
+      - MCP_TRANSPORT="stdio"
+      - MCP_PORT="8000"
     depends_on:
       openhab:
         condition: service_healthy

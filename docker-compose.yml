@@ -12,6 +12,8 @@ services:
       - OPENHAB_API_TOKEN=${OPENHAB_API_TOKEN:-}
       - OPENHAB_USERNAME=${OPENHAB_USERNAME:-}
       - OPENHAB_PASSWORD=${OPENHAB_PASSWORD:-}
+      - MCP_TRANSPORT=${MCP_TRANSPORT:-}
+      - MCP_PORT=${MCP_PORT:-}
       - LOG_LEVEL=INFO
     volumes:
       - ./process_template_override:/app/process_templates/override

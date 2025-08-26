@@ -1,4 +1,4 @@
-mcp
+fastmcp
 python-dotenv
 requests
 pydantic>=2.0.0
