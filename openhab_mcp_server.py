@@ -84,7 +84,7 @@ def list_items(
         1,
         description="Page number of paginated result set. Page index starts with 1. There are more items when `has_next` is true",
     ),
-    page_size: int = Field(15, description="Number of elements shown per page"),
+    page_size: int = Field(1000, description="Number of elements shown per page"),
     sort_order: str = Field("asc", description="Sort order", examples=["asc", "desc"]),
     filter_tag: str = Field(
         "",
@@ -205,32 +205,19 @@ def get_item_state(
     """
     return openhab_client.get_item_state(item_name)
 
-
 @mcp.tool()
 def update_item_state(
-    item_name: str = Field(..., description="Name of the item to update state for"),
-    state: str = Field(
-        ...,
-        description="State to update the item to as string. Type conversion must be possible for the item type",
-        examples=[
-            "ON",
-            "OFF",
-            "140.5",
-            "14%",
-            "20 kWH",
-            "2025-06-03T22:21:13.123Z",
-            "This is a text",
-        ],
-    ),
+    item_name: str = Field(..., description="Exact technical UID of the item"),
+    state: str = Field(..., description="Command to send, e.g. ON, OFF, DOWN, 100"),
 ) -> Dict[str, Any]:
     """
-    Update the state of an openHAB item
+    Update the state of an openHAB item.
 
-    Args:
-        item_name: Name of the item to update state for
-        state: State to update the item to. Allowed states depend on the item type
+    For Switch, Dimmer and Rollershutter items this sends a POST command
+    to /rest/items/<item> with Content-Type: text/plain.
     """
-    return openhab_client.update_item_state(item_name, state)
+    # Optional: Schreibweise vereinheitlichen
+    return openhab_client.send_command(item_name, state.upper())
 
 
 @mcp.tool()
@@ -416,6 +403,119 @@ def remove_item_member(
     return openhab_client.remove_item_member(item_name, member_item_name)
 
 
+@mcp.tool()
+def find_item_uid(
+    search_terms: List[str] = Field(..., description="List of keywords to match against an item's name or label"),
+    sort_order: str = Field("asc", description="Sort order for list_items: 'asc' or 'desc'")
+) -> Dict[str, Any]:
+    """
+    Searches through all openHAB items page by page until an item's name or label
+    contains all given search terms (case-insensitive). Returns the first matching UID.
+    """
+    return openhab_client.find_item_uid(search_terms, sort_order)
+
+def _normalize_variants(name: str) -> List[str]:
+    """Generate common variants and tokens from a name/label."""
+    if not name:
+        return []
+    s = name.strip()
+    variants = {
+        s,
+        s.replace(" ", "_"),
+        s.replace("_", " "),
+        s.replace("-", "_"),
+        s.replace("-", " "),
+    }
+    tokens = []
+    for v in list(variants):
+        for t in re.split(r'[_\s\-]', v):
+            if len(t) > 1:
+                tokens.append(t)
+    return list(variants) + list(dict.fromkeys(tokens))  # unique order
+
+def _resolve_uid(item_name: Optional[str], terms: Optional[List[str]]) -> Dict[str, Any]:
+    """Try to resolve a UID from either an exact name or search terms, with fallbacks."""
+    # 1) Try direct item_name and its variants
+    variant_names = _normalize_variants(item_name) if item_name else []
+    for candidate in variant_names:
+        try:
+            item = openhab_client.get_item(candidate)
+            if item and item.get("name"):
+                return {"uid": item["name"], "label": item.get("label")}
+        except Exception:
+            pass
+
+    # 2) Build search terms from provided terms + derived tokens
+    search_terms = []
+    if terms:
+        search_terms.extend(terms)
+    if item_name:
+        search_terms.extend(_normalize_variants(item_name))
+
+    # Deduplicate (case-insensitive)
+    cleaned = []
+    seen = set()
+    for t in search_terms:
+        tt = str(t).strip()
+        if not tt or tt.lower() in seen:
+            continue
+        seen.add(tt.lower())
+        cleaned.append(tt)
+
+    if not cleaned:
+        return {"error": "Neither item_name nor search terms provided"}
+
+    uid_result = openhab_client.find_item_uid(cleaned)
+    if "error" in uid_result:
+        return {"error": uid_result["error"]}
+    return {"uid": uid_result["uid"], "label": uid_result.get("label")}
+
+@mcp.tool()
+def safe_switch_item(
+    command: str = Field(..., description="Command to send (ON, OFF, %, UP, DOWN, STOP, etc.)"),
+    terms: Optional[List[str]] = Field(None, description="Keywords to match against item name/label"),
+    item_name: Optional[str] = Field(None, description="Exact UID if known; labels/natural names will be resolved automatically"),
+) -> Dict[str, Any]:
+    """
+    Robust switch command:
+    - Accepts exact UID (item_name) OR search terms (terms) OR both
+    - Automatically adds tokens like 'EG', 'OG' from item_name or label
+    - Tries direct UID variants (spaces/underscores) before falling back to search
+    - Checks current state and only sends the command if needed
+    """
+    resolved = _resolve_uid(item_name, terms)
+    if "error" in resolved:
+        return {"error": resolved["error"]}
+    uid = resolved["uid"]
+
+    # Get current state
+    item = openhab_client.get_item(uid)
+    label = item.get("label", uid)
+    current_state = str(item.get("state", "")).upper()
+
+    # Normalize command
+    desired_state = str(command).upper()
+
+    # Switch if needed
+    changed = False
+    final_state = current_state
+    if current_state != desired_state:
+        openhab_client.send_command(uid, desired_state)
+        changed = True
+        try:
+            item_after = openhab_client.get_item(uid)
+            final_state = str(item_after.get("state", desired_state)).upper()
+        except Exception:
+            final_state = desired_state
+
+    return {
+        "uid": uid,
+        "label": label,
+        "previous_state": current_state,
+        "final_state": final_state,
+        "changed": changed
+    }    
+    
 # Links
 @mcp.tool()
 def list_links(

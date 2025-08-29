@@ -353,16 +353,11 @@ class OpenHABClient:
             raise ValueError("State must be provided")
 
         # Update state
-        response = self.session.put(
-            f"{self.base_url}/rest/items/{item_name}/state",
-            data=state,
-            headers={"Content-Type": "text/plain"},
-        )
-        if response.status_code == 404:
-            raise ValueError(f"Item with name '{item_name}' not found")
-        response.raise_for_status()
-
-        return True
+        """
+        For all controllable items, send the value as a command via POST.
+        This replaces the old PUT-to-/state to avoid 400 errors.
+        """
+        return self.send_command(item_name, state)
 
     def send_command(self, item_name: str, command: str) -> Dict[str, Any]:
         """
@@ -384,17 +379,11 @@ class OpenHABClient:
         if not command:
             raise ValueError("Command must be provided")
 
-        # Send command
-        response = self.session.post(
-            f"{self.base_url}/rest/items/{item_name}",
-            data=command,
-            headers={"Content-Type": "text/plain"},
-        )
-        if response.status_code == 404:
-            raise ValueError(f"Item with name '{item_name}' not found")
-        response.raise_for_status()
-
-        return True
+        url = f"{self.base_url}/rest/items/{item_name}"
+        headers = {"Content-Type": "text/plain"}
+        resp = requests.post(url, headers=headers, data=command)
+        resp.raise_for_status()
+        return {"status": resp.status_code, "url": url, "command": command}
 
     def get_item_persistence(
         self, item_name: str, starttime: str = None, endtime: str = None
@@ -600,6 +589,39 @@ class OpenHABClient:
         response.raise_for_status()
         return self.get_item(item_name)
 
+    def find_item_uid(self, search_terms: list, sort_order: str = "asc") -> Dict[str, Any]:
+        """
+        Search across openHAB items, loading additional pages as needed,
+        until a match is found or all pages are exhausted.
+
+        Args:
+            search_terms: list of lowercase terms to match in 'name' or 'label'
+            sort_order: 'asc' or 'desc'
+
+        Returns:
+            {"uid": <string>} if found, or {"error": <message>} if not.
+        """
+        page_size = 200
+        page = 1
+        has_next = True
+
+        while has_next:
+            resp = self.list_items(page=page, page_size=page_size, sort_order=sort_order)
+            items = resp.get("items", [])
+
+            for item in items:
+                label_val = (item.get("label") or "").lower()
+                name_val = (item.get("name") or "").lower()
+                name_match = all(term.lower() in name_val for term in search_terms)
+                label_match = all(term.lower() in label_val for term in search_terms)
+                if name_match or label_match:
+                    return {"uid": item["name"]}
+
+            has_next = resp.get("pagination", {}).get("has_next", False)
+            page += 1
+
+        return {"error": f"No item found for terms: {search_terms}"}
+    
     # ===== Links =====
     def list_links(
         self,
