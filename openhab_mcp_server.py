@@ -169,13 +169,6 @@ def list_items(
     if itype.startswith("property_"):
         tag, itype = itype, ""
 
-    # Optional fuzzy correction for room names
-    known_rooms = ["wohnzimmer", "küche", "schlafzimmer", "bad", "flur"]
-    if fname and fname not in known_rooms:
-        corrected = _closest_match(fname, known_rooms)
-        if corrected != fname:
-            fname = corrected
-
     # Primary item query
     response = openhab_client.list_items(
         page=page,
