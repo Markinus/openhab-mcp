@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Any
 from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import Field
+import re
 
 # Configure logging to suppress INFO messages
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +21,11 @@ logging.basicConfig(level=logging.INFO)
 # Import the MCP server implementation
 from fastmcp.server import FastMCP
 from template_manager import TemplateManager, ProcessTemplate
+
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # oder DEBUG, je nach Bedarf
 
 template_manager = TemplateManager()
 
@@ -77,72 +83,205 @@ openhab_client = OpenHABClient(
 )
 
 
-# Item Tools
+# Hilfsfunktionen für sichere String-Operationen
+def _safe_lower(val):
+    return val.lower() if isinstance(val, str) else ""
+
+def _norm_str(val):
+    return val.strip().lower() if isinstance(val, str) else ""
+
+def _valid_sort_order(order):
+    if isinstance(order, str) and order.upper() in ("ASC", "DESC"):
+        return order.upper()
+    return "ASC"
+
+# Optional: einfache Fuzzy-Korrektur für Raum-/Ortsnamen
+def _closest_match(token, choices, cutoff=0.8):
+    import difflib
+    if not token or not choices:
+        return token
+    matches = difflib.get_close_matches(token, choices, n=1, cutoff=cutoff)
+    return matches[0] if matches else token
+
 @mcp.tool()
 def list_items(
-    page: int = Field(
-        1,
-        description="Page number of paginated result set. Page index starts with 1. There are more items when `has_next` is true",
-    ),
-    page_size: int = Field(1000, description="Number of elements shown per page"),
-    sort_order: str = Field("asc", description="Sort order", examples=["asc", "desc"]),
-    filter_tag: str = Field(
-        "",
-        description="Optional filter items by tag (either a non-semantic tag or the name of a semantic tag). All available semantic tags can be retrieved from the `list_tags` tool",
-        examples=["Location", "Window", "Light", "FrontDoor"],
-    ),
-    filter_type: str = Field(
-        "",
-        description="Optional filter items by type",
-        examples=["Switch", "Group", "String", "DateTime"],
-    ),
-    filter_name: str = Field(
-        "",
-        description="Optional filter items by name. All items that contain the filter value in their name are returned",
-        examples=["Kitchen", "LivingRoom", "Bedroom"],
-    ),
-    filter_fields: List[str] = Field(
-        [],
-        description="Optional filter items by fields. Item name will always be included by default.",
-        examples=["name", "label", "type", "semantic_tags", "non_semantic_tags"],
-    ),
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    sort_order: Optional[str] = None,
+    filter_tag: Optional[str] = None,
+    filter_type: Optional[str] = None,
+    filter_name: Optional[str] = None,
+    filter_fields: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    Gives a list of openHAB items with only basic information. Use this tool
-    to get an overview of your items. Use the `get_item_details` tool to get
-    more information about a specific item.
+    Retrieve a list of all known controllable OpenHAB items.
 
-    Args:
-        page: Page number of paginated result set. Page index starts with 1. There are more items when `has_next` is true
-        page_size: Number of elements shown per page
-        sort_order: Sort order
-        filter_tag: Optional filter items by tag (either a non-semantic tag or the name of a semantic tag). All available semantic tags can be retrieved from the `list_tags` tool
-        filter_type: Optional filter items by type
-        filter_name: Optional filter items by name. All items that contain the filter value in their name are returned
-        filter_fields: Optional filter items by fields. Item name will always be included by default.
+    When to use:
+    - The user asks for all devices/items in the system.
+    - The user requests a filtered list by type, tag, or location.
+    - The user asks "Which … do you know in …" or "Show me all … in …" (inventory queries).
+    - To answer questions about what devices exist without changing their state.
+
+    Behavior:
+    - Returns label and technical UID for each matching item.
+    - Supports filtering by:
+        • tag (e.g., Property_Light, Property_Temperature, Property_Motion)
+        • type (e.g., Switch, Dimmer, Contact)
+        • name or part of name (e.g., "wohnzimmer" for living room)
+    - Pagination and sorting are optional.
+
+    Mapping hints:
+    - Lights: filter_tag="Property_Light" OR filter_type="Switch"
+    - Temperature sensors:
+    filter_tag="Property_Temperature"
+    - Motion sensors: filter_tag="Property_Motion"
+    - Window contacts: filter_tag="Property_Contact"
+    - Humidity sensors: filter_tag="Property_Humidity"
+    - Presence sensors: filter_tag="Property_Presence"
+    - Combine with filter_name for location/room (e.g., "kitchen", "wohnzimmer").
+
+    Examples:
+    - "Show me all devices" → no filters.
+    - "List all switches" → filter_type="Switch".
+    - "List all temperature sensors in the kitchen" → filter_tag="Property_Temperature", filter_name="kitchen".
+    - "Welche Lichter im Wohnzimmer kennst du?" → filter_tag="Property_Light", filter_name="wohnzimmer".
+
+    Error handling:
+    - Returns empty list if no items match.
+    - If unsure which filter to apply, return all items or ask the user for clarification.
+
+    Notes:
+    - This tool is for listing/inventory purposes only; do not use it to change device states.
+    - For controlling devices, use `safe_switch_item` instead.
     """
-    return openhab_client.list_items(
+    # Normalize input parameters
+    tag = _norm_str(filter_tag)
+    itype = _norm_str(filter_type)
+    fname = _norm_str(filter_name)
+    order = _valid_sort_order(sort_order)
+
+    # Build type list for filtering (e.g., ["switch", "dimmer"])
+    type_list = set()
+    if itype:
+        type_list = {t.strip().lower() for t in itype.split(",") if t.strip()}
+
+    # Correct mapping if filter_type is actually a tag
+    if itype.startswith("property_"):
+        tag, itype = itype, ""
+
+    # Optional fuzzy correction for room names
+    known_rooms = ["wohnzimmer", "küche", "schlafzimmer", "bad", "flur"]
+    if fname and fname not in known_rooms:
+        corrected = _closest_match(fname, known_rooms)
+        if corrected != fname:
+            fname = corrected
+
+    # Primary item query
+    response = openhab_client.list_items(
         page=page,
         page_size=page_size,
-        sort_order=sort_order,
-        filter_tag=filter_tag,
-        filter_type=filter_type,
-        filter_name=filter_name,
-        filter_fields=filter_fields,
+        sort_order=order,
+        filter_tag=tag or None,
+        filter_type=itype or None,
+        filter_name=fname or None,
+        filter_fields=filter_fields
     )
+    items = response.get("items", [])
 
+    # Fallback: search groups with category "Lightbulb" and include their Switch/Dimmer members
+    group_items = []
+    if filter_fields == ["category"] and ("switch" in type_list or "dimmer" in type_list):
+        group_response = openhab_client.list_items(
+            page_size=200, 
+            filter_fields=["category", "members"], 
+            filter_name="Lightbulb"
+        )
+        all_groups = group_response.get("items", [])
+        logger.info(f"Found {len(all_groups)} groups with category 'Lightbulb'")
 
+        for group in all_groups:
+            if not isinstance(group, dict):
+                logger.warning(f"Unexpected group type: {type(group)} – {group}")
+                continue
+
+            group_label = _safe_lower(group.get("label", ""))
+            group_name = _safe_lower(group.get("name", ""))
+            if fname and fname not in group_label and fname not in group_name:
+                continue
+            logger.info(f"Get group '{group.get('name')}' – match with room '{fname}'")
+
+            members = group.get("members", [])
+            if not isinstance(members, list):
+                continue
+
+            for member in members:
+                member_uid = member if isinstance(member, str) else member.get("name")
+                if not member_uid:
+                    continue
+                try:
+                    member_item = openhab_client.get_full_item(member_uid)
+                    if isinstance(member_item, dict):
+                        mtype = _safe_lower(member_item.get("type", ""))
+                        if mtype in ["switch", "dimmer"]:
+                            group_items.append(member_item)
+                except Exception as e:
+                    logger.warning(f"Error retrieving item '{member_uid}': {e}")
+
+    # Final filtering function
+    def matches_item(it):
+        if not isinstance(it, dict):
+            return False
+        name = _safe_lower(it.get("name"))
+        label = _safe_lower(it.get("label"))
+        if tag and tag not in [t.lower() for t in (it.get("tags") or [])]:
+            return False
+        if itype and _safe_lower(it.get("type")) != itype:
+            return False
+        if fname and fname not in name and fname not in label:
+            return False
+        return True
+
+    # Apply filtering and merge group items
+    if isinstance(items, list):
+        items = [it for it in items if matches_item(it)]
+        items += group_items
+
+    # Remove duplicates
+    seen = set()
+    unique_items = []
+    for it in items:
+        if not isinstance(it, dict):
+            logger.warning(f"Unexpected item type during deduplication: {type(it)} – {it}")
+            continue
+        uid = it.get("name")
+        if uid and uid not in seen:
+            seen.add(uid)
+            unique_items.append(it)
+
+    # Return final result
+    return { "items": unique_items }
+   
 @mcp.tool()
 def get_item(
-    item_name: str = Field(..., description="Name of the item to get details for"),
+    item_name: str = Field(..., description="Exact technical UID of the item")
 ) -> Dict[str, Any]:
     """
-    Gives a detailed description of an openHAB item. Use this tool to get
-    information about a specific item.
+    Retrieve details and current state of a specific OpenHAB item.
 
-    Args:
-        item_name: Name of the item to get details for
-    """
+    Use when:
+    - You need to check the current state before deciding to send a command.
+    - The user asks for the status of a specific device.
+
+    Behavior:
+    - Returns type, label, and current state.
+    - Requires the exact technical UID.
+
+    Example:
+    - "Is the living room light on?" → find UID, then call get_item(name=UID).
+
+    Error handling:
+    - Returns error if the item does not exist.
+    """    
     return openhab_client.get_item(item_name)
 
 
@@ -207,18 +346,28 @@ def get_item_state(
 
 @mcp.tool()
 def update_item_state(
-    item_name: str = Field(..., description="Exact technical UID of the item"),
-    state: str = Field(..., description="Command to send, e.g. ON, OFF, DOWN, 100"),
+    name: str = Field(..., description="Exact technical UID of the item"),
+    state: str = Field(..., description="Command to send, e.g., ON, OFF, UP, DOWN, STOP, 0–100")
 ) -> Dict[str, Any]:
     """
-    Update the state of an openHAB item.
+    Send a command to an OpenHAB item.
 
-    For Switch, Dimmer and Rollershutter items this sends a POST command
-    to /rest/items/<item> with Content-Type: text/plain.
-    """
-    # Optional: Schreibweise vereinheitlichen
+    Use when:
+    - You already know the exact UID and the desired command.
+    - You do not need to search for the item.
+
+    Behavior:
+    - Sends a POST to /rest/items/<item> with Content-Type: text/plain.
+    - For Switch, Dimmer, and Rollershutter items, commands are ON/OFF, 0–100, UP/DOWN/STOP.
+
+    Examples:
+    - Turn off a known switch: name="Licht_EG_Wohnzimmer", state="OFF".
+    - Set dimmer to 50%: name="Dimmer_Kitchen", state="50".
+
+    Error handling:
+    - Returns error if the item does not exist or the command is invalid.
+    """    # Optional: Schreibweise vereinheitlichen
     return openhab_client.send_command(item_name, state.upper())
-
 
 @mcp.tool()
 def send_command(
@@ -405,12 +554,47 @@ def remove_item_member(
 
 @mcp.tool()
 def find_item_uid(
-    search_terms: List[str] = Field(..., description="List of keywords to match against an item's name or label"),
-    sort_order: str = Field("asc", description="Sort order for list_items: 'asc' or 'desc'")
+    search_terms: List[str] = Field(
+        ...,
+        description=(
+            "Keywords to match against an item's technical name or label. "
+            "Matches are case-insensitive. All terms must be present in either the name or label. "
+            "Can include partial words, synonyms, translations, and abbreviations."
+        )
+    ),
+    sort_order: str = Field(
+        "asc",
+        description=(
+            "Sort order for scanning items: 'asc' or 'desc'. "
+            "Determines the order in which matches are evaluated."
+        )
+    )
 ) -> Dict[str, Any]:
     """
-    Searches through all openHAB items page by page until an item's name or label
-    contains all given search terms (case-insensitive). Returns the first matching UID.
+    Find the exact UID of the first OpenHAB item whose name or label contains all provided search terms.
+
+    When to use:
+    - You have descriptive keywords but not the exact technical UID.
+    - You need to resolve a natural language reference (e.g., 'living room light') to a technical UID.
+    - As part of a control workflow before calling `get_item` or `update_item_state`.
+
+    Behavior:
+    - Searches through all OpenHAB items page by page.
+    - Matching is case-insensitive.
+    - All search terms must be present in the name or label for a match.
+    - Returns the first matching UID and, if available, the label.
+
+    Examples:
+    - search_terms=["licht", "wohnzimmer"] → might return {"uid": "Licht_EG_Wohnzimmer", "label": "Licht EG Wohnzimmer"}
+    - search_terms=["roller", "küche"] → might return {"uid": "Rolladen_Kueche", "label": "Rolladen Küche"}
+
+    Error handling:
+    - Returns {"error": "..."} if no matching item is found.
+    - Returns {"error": "..."} if search_terms is empty.
+
+    Notes:
+    - For best results, include all distinctive parts of the item name or label (e.g., floor identifiers like 'EG', 'OG').
+    - This tool is often used internally by `safe_switch_item` to resolve search terms to a UID.
     """
     return openhab_client.find_item_uid(search_terms, sort_order)
 
@@ -473,15 +657,34 @@ def _resolve_uid(item_name: Optional[str], terms: Optional[List[str]]) -> Dict[s
 @mcp.tool()
 def safe_switch_item(
     command: str = Field(..., description="Command to send (ON, OFF, %, UP, DOWN, STOP, etc.)"),
-    terms: Optional[List[str]] = Field(None, description="Keywords to match against item name/label"),
-    item_name: Optional[str] = Field(None, description="Exact UID if known; labels/natural names will be resolved automatically"),
+    terms: Optional[List[str]] = Field(None, description="Keywords from the item's label or name to identify it. Can be partial; synonyms and translations are allowed."),
+    item_name: Optional[str] = Field(None, description="Exact technical UID of the item, e.g., 'Licht_EG_Wohnzimmer'. Only use if 100% sure.")
 ) -> Dict[str, Any]:
     """
-    Robust switch command:
-    - Accepts exact UID (item_name) OR search terms (terms) OR both
-    - Automatically adds tokens like 'EG', 'OG' from item_name or label
-    - Tries direct UID variants (spaces/underscores) before falling back to search
-    - Checks current state and only sends the command if needed
+    Fallback-safe switch tool for controlling switches, dimmers, and rollershutters.
+
+    Use when:
+    - The user gives a control command (on/off/dim/move) for a device.
+    - You have either search terms or the exact UID (or both).
+
+    Behavior:
+    - Accepts either `terms` or `item_name` (or both).
+    - If `item_name` is given, tries direct match and common variants (spaces ↔ underscores, hyphens).
+    - If not found, falls back to `find_item_uid` using expanded search terms.
+    - Automatically adds tokens from the name/label (e.g., 'EG', 'OG') to improve matching.
+    - Checks current state before sending the command; only sends if a change is needed.
+    - Returns the final state and whether it was changed.
+
+    Examples:
+    - Turn on living room light: terms=["licht","wohnzimmer"], command="ON"
+    - Close kitchen blinds: terms=["rollladen","küche"], command="DOWN"
+    - Dim dining room light to 50%: terms=["licht","essen"], command="50"
+
+    Error handling:
+    - If neither `terms` nor `item_name` is provided, returns an error.
+    - If no matching item is found, returns an error.
+
+    Always confirm the action to the user based on the returned label and final_state.
     """
     resolved = _resolve_uid(item_name, terms)
     if "error" in resolved:
@@ -1126,21 +1329,22 @@ def update_item_members(
 
 # Inbox Tools
 @mcp.tool()
-def list_inbox_things(
-    page: int = Field(1, description="Page number (1-based)"),
-    page_size: int = Field(15, description="Number of items per page"),
-    sort_order: str = Field("asc", description="Sort order (asc or desc)"),
-) -> Dict[str, Any]:
+def list_inbox_things() -> Dict[str, Any]:
     """
-    Get a paginated list of discovered things in the inbox
+    Retrieve all newly discovered or ignored devices ("Things") from the OpenHAB inbox.
 
-    Args:
-        page: Page number (1-based)
-        page_size: Number of items per page
-        sort_order: Sort order ("asc" or "desc")
+    Use when:
+    - The user asks for new, unadded, or ignored devices.
+    - The user wants to know what devices are available to add.
 
-    Returns:
-        Dictionary containing pagination info and list of inbox items
+    Behavior:
+    - Returns each thing's label, UID, and status (NEW or IGNORED).
+
+    Example:
+    - "What new devices have been found?" → call this tool.
+
+    Error handling:
+    - Returns empty list if no new or ignored devices are present.
     """
     return openhab_client.list_inbox_things(
         page=page, page_size=page_size, sort_order=sort_order

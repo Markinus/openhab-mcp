@@ -76,70 +76,100 @@ class OpenHABClient:
         Returns:
             Dictionary containing the paginated results and pagination info
         """
-        # Get all tags for semantic/non-semantic tag processing
-        tags = self.list_semantic_tags()
 
+        # --- Parameter-Guards ---
+        if not isinstance(page, int) or page < 1:
+            page = 1
+        if not isinstance(page_size, int) or page_size < 1:
+            page_size = 15
+        if not isinstance(sort_order, str) or sort_order.lower() not in ("asc", "desc"):
+            sort_order = "asc"
+
+        # Normalisierung der Filter
         if filter_tag and "_" in filter_tag:
             filter_tag = filter_tag.split("_")[-1]
 
-        # Prepare API parameters
+        if isinstance(filter_name, str):
+            filter_name = filter_name.strip().lower()
+            # Optional: Fuzzy-Korrektur gegen bekannte Räume
+            known_rooms = ["wohnzimmer", "küche", "schlafzimmer", "bad", "flur", "büro", "esszimmer", "arbeitszimmer"]
+            import difflib
+            if filter_name not in known_rooms:
+                match = difflib.get_close_matches(filter_name, known_rooms, n=1, cutoff=0.8)
+                if match:
+                    filter_name = match[0]
+
+        # --- API-Parameter vorbereiten ---
+        tags = self.list_semantic_tags()
+        # --- Sanitize and split filter_type ---
+        type_list = None
+        if isinstance(filter_type, str):
+            # allow comma-separated types like "Switch,Dimmer"
+            type_list = {t.strip() for t in filter_type.split(",") if t.strip()}
+            if not type_list:
+                type_list = None
+
+        # --- Extract category filter if provided via filter_fields ---
+        category_filter = None
+        if filter_fields and "category" in filter_fields:
+            # Expect category name in filter_name for category filtering
+            # e.g., category=Lightbulb, Blinds, Window
+            category_filter = filter_name
+            # Don't use filter_name for name matching in this case
+            filter_name = None
         params = {}
         if filter_tag:
             params["tags"] = filter_tag
         if filter_type:
             params["type"] = filter_type
-        
-        # Determine which fields to include in the final output
+
         output_fields = set(filter_fields) if filter_fields else None
-        
         if output_fields:
-            # Prepare API fields to request
-            api_fields = {"name"}  # Always include name for identification
-            
-            # Add fields needed for tag processing
-            if ("semanticTags" in output_fields or "nonSemanticTags" in output_fields):
+            api_fields = {"name"}  # Always include name
+            if "semanticTags" in output_fields or "nonSemanticTags" in output_fields:
                 api_fields.update(["tags"])
-                
-            # Add other requested fields
-            if output_fields:
-                api_fields.update(f for f in output_fields if f not in ["semanticTags", "nonSemanticTags"])
-                
-            # Convert to comma-separated string for the API
+            api_fields.update(f for f in output_fields if f not in ["semanticTags", "nonSemanticTags"])
             params["fields"] = ",".join(api_fields)
 
-        # Set recursive if members are requested
         if not filter_fields or "members" in filter_fields:
             params["recursive"] = "true"
-            
-        # Make the API request
+
+        # --- API-Request ---
         response = self.session.get(f"{self.base_url}/rest/items", params=params)
         response.raise_for_status()
-
-        # Process the response
         response_json = response.json()
+
+        # --- Filter anwenden ---
         processed_items = []
-        
         for item in response_json:
-            # Skip items that don't match the name filter (if provided)
-            if filter_name and filter_name.lower() not in item.get("name", "").lower():
+            # Filter by category if requested
+            if category_filter and item.get("category", "").lower() != category_filter.lower():
                 continue
-                
-            # Process the item and its members
+
+            # Filter by name/label if filter_name is set (room/location)
+            if filter_name:
+                name_l = item.get("name", "").lower()
+                label_l = item.get("label", "").lower()
+                if filter_name not in name_l and filter_name not in label_l:
+                    continue
+
+            # Filter by type if type_list is set
+            if type_list and item.get("type") not in type_list:
+                continue            
             processed_item = self._process_member(item, output_fields, tags)
             processed_items.append(processed_item)
-        
-        # Apply sorting
+
+        # --- Sortierung ---
         reverse_sort = sort_order.lower() == "desc"
         processed_items.sort(key=lambda x: x.get("name", ""), reverse=reverse_sort)
-        
-        # Apply pagination
+
+        # --- Pagination ---
         total_items = len(processed_items)
         total_pages = (total_items + page_size - 1) // page_size if page_size > 0 else 1
         start_idx = (page - 1) * page_size
         end_idx = start_idx + page_size
         paginated_items = processed_items[start_idx:end_idx]
-        
-        # Return paginated results as a dictionary
+
         return {
             "items": paginated_items,
             "pagination": {
@@ -170,6 +200,20 @@ class OpenHABClient:
             raise ValueError(f"Item with name '{item_name}' not found")
         
         return result["items"][0]
+
+    def get_full_item(self, uid: str) -> Dict[str, Any]:
+        """
+        Retrieve full details of a single OpenHAB item by UID.
+ 
+        Args:
+            uid: The technical name of the item (e.g., "Licht_OG_Flur")
+
+        Returns:
+            A dictionary containing all available fields for the item.
+        """
+        response = self.session.get(f"{self.base_url}/rest/items/{uid}")
+        response.raise_for_status()
+        return response.json()
 
     def create_item(self, item: ItemCreate) -> Dict[str, Any]:
         """
